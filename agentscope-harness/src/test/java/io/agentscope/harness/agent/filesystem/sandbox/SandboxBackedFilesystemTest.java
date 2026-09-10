@@ -337,6 +337,39 @@ class SandboxBackedFilesystemTest {
         assertEquals("transfer down", responses.get(0).error());
     }
 
+    @Test
+    void uploadFiles_whenSandboxStopped_failsSoftWithNoActiveSandbox() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeTransferSandbox sandbox = new FakeTransferSandbox("/workspace");
+        sandbox.running = false;
+        filesystem.setSandbox(sandbox);
+
+        List<FileUploadResponse> responses =
+                filesystem.uploadFiles(RT, List.of(Map.entry("/workspace/a.txt", new byte[] {1})));
+
+        assertEquals(1, responses.size());
+        assertTrue(!responses.get(0).isSuccess());
+        assertEquals(SandboxBackedFilesystem.NO_ACTIVE_SANDBOX_MESSAGE, responses.get(0).error());
+        assertTrue(sandbox.uploaded.isEmpty());
+    }
+
+    @Test
+    void downloadFiles_whenSandboxStopped_failsSoftWithNoActiveSandbox() {
+        SandboxBackedFilesystem filesystem = new SandboxBackedFilesystem();
+        FakeTransferSandbox sandbox = new FakeTransferSandbox("/workspace");
+        sandbox.uploaded.put("/workspace/b.bin", new byte[] {9});
+        sandbox.running = false;
+        filesystem.setSandbox(sandbox);
+
+        List<FileDownloadResponse> responses =
+                filesystem.downloadFiles(RT, List.of("/workspace/b.bin"));
+
+        assertEquals(1, responses.size());
+        assertTrue(!responses.get(0).isSuccess());
+        assertEquals(SandboxBackedFilesystem.NO_ACTIVE_SANDBOX_MESSAGE, responses.get(0).error());
+        assertNull(sandbox.lastCommand);
+    }
+
     private static void assertArchive(byte[] archive, String expectedPath, byte[] expectedContent)
             throws IOException {
         try (TarArchiveInputStream tar =
@@ -398,6 +431,7 @@ class SandboxBackedFilesystemTest {
         protected byte[] hydratedArchive;
         protected int hydrateCalls;
         protected boolean failHydration;
+        protected boolean running = true;
 
         protected BaseFakeSandbox(ExecResult execResult) {
             this.execResult = execResult;
@@ -409,7 +443,9 @@ class SandboxBackedFilesystemTest {
         public void start() {}
 
         @Override
-        public void stop() {}
+        public void stop() {
+            running = false;
+        }
 
         @Override
         public void shutdown() {}
@@ -419,7 +455,7 @@ class SandboxBackedFilesystemTest {
 
         @Override
         public boolean isRunning() {
-            return true;
+            return running;
         }
 
         @Override

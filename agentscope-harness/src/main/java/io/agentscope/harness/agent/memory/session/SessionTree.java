@@ -22,6 +22,7 @@ import io.agentscope.harness.agent.filesystem.model.ReadResult;
 import io.agentscope.harness.agent.filesystem.sandbox.PinnedSandboxFilesystem;
 import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAware;
+import io.agentscope.harness.agent.sandbox.SandboxMirrorReleaseCoordinator;
 import io.agentscope.harness.agent.transcript.ObjectStoreTranscriptStore;
 import io.agentscope.harness.agent.transcript.TranscriptRef;
 import io.agentscope.harness.agent.transcript.TranscriptStore;
@@ -112,9 +113,15 @@ public class SessionTree {
      * @return {@code true} if the mirrors quiesced within the timeout
      */
     public static boolean awaitMirrorQuiescence(long timeout, TimeUnit unit) {
+        long deadlineNanos = System.nanoTime() + unit.toNanos(timeout);
         try {
-            MIRROR_EXECUTOR.submit(() -> {}).get(timeout, unit);
-            return true;
+            long mirrorWaitNanos = Math.max(0L, deadlineNanos - System.nanoTime());
+            MIRROR_EXECUTOR.submit(() -> {}).get(mirrorWaitNanos, TimeUnit.NANOSECONDS);
+            // Deferred stop/shutdown runs on a separate executor; drain it too so graceful close
+            // does not race sandbox teardown that was scheduled from mirror finally blocks.
+            long releaseWaitNanos = Math.max(0L, deadlineNanos - System.nanoTime());
+            return SandboxMirrorReleaseCoordinator.awaitReleaseQuiescence(
+                    releaseWaitNanos, TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
@@ -550,7 +557,7 @@ public class SessionTree {
         if (transcriptStore == null || transcriptRef == null || entries.isEmpty()) {
             return;
         }
-        // Same pin as scheduleMirror: async segment upload must survive call unbind.
+        // Prepare work before retain so a failure here cannot leak a deferred sandbox release.
         final AbstractFilesystem mirrorFs = pinIfSandbox(filesystem);
         final TranscriptStore store = transcriptStoreForMirror(mirrorFs);
         final TranscriptRef ref = transcriptRef;
@@ -558,9 +565,10 @@ public class SessionTree {
         for (SessionEntry entry : entries) {
             sb.append(JsonUtils.getJsonCodec().toJson(entry)).append('\n');
         }
-        byte[] payload = sb.toString().getBytes(StandardCharsets.UTF_8);
-        String wid = writerId;
-        MIRROR_EXECUTOR.execute(
+        final byte[] payload = sb.toString().getBytes(StandardCharsets.UTF_8);
+        final String wid = writerId;
+        submitPinnedMirror(
+                mirrorFs,
                 () -> {
                     try {
                         store.appendSegment(ref, seqStart, seqEnd, wid, payload);
@@ -584,14 +592,45 @@ public class SessionTree {
         if (filesystem == null || workspaceRoot == null) {
             return;
         }
+        // Resolve paths before retain so retain↔execute has no prepare-side leak window.
         final AbstractFilesystem mirrorFs = pinIfSandbox(filesystem);
         final String contextRel = resolveRelativePath(contextFile);
         final String logRel = resolveRelativePath(logFile);
-        MIRROR_EXECUTOR.execute(
+        submitPinnedMirror(
+                mirrorFs,
                 () -> {
                     mirrorToFilesystem(mirrorFs, contextFile, contextRel);
                     mirrorToFilesystem(mirrorFs, logFile, logRel);
                 });
+    }
+
+    /**
+     * Retains a pinned sandbox (if any), submits {@code task} to the mirror executor, and always
+     * pairs {@code releaseMirror} — either in the task {@code finally} or immediately when
+     * submission itself fails.
+     */
+    private static void submitPinnedMirror(AbstractFilesystem mirrorFs, Runnable task) {
+        final Sandbox retainedSandbox = sandboxForMirrorRetain(mirrorFs);
+        if (retainedSandbox != null) {
+            SandboxMirrorReleaseCoordinator.retain(retainedSandbox);
+        }
+        try {
+            MIRROR_EXECUTOR.execute(
+                    () -> {
+                        try {
+                            task.run();
+                        } finally {
+                            if (retainedSandbox != null) {
+                                SandboxMirrorReleaseCoordinator.releaseMirror(retainedSandbox);
+                            }
+                        }
+                    });
+        } catch (RuntimeException e) {
+            if (retainedSandbox != null) {
+                SandboxMirrorReleaseCoordinator.releaseMirror(retainedSandbox);
+            }
+            throw e;
+        }
     }
 
     /**
@@ -606,6 +645,17 @@ public class SessionTree {
             }
         }
         return fs;
+    }
+
+    /**
+     * Returns the sandbox pinned for an async mirror task, or {@code null} when the mirror does
+     * not hold a sandbox connection that must defer self-managed release.
+     */
+    private static Sandbox sandboxForMirrorRetain(AbstractFilesystem mirrorFs) {
+        if (mirrorFs instanceof PinnedSandboxFilesystem pinned) {
+            return pinned.getSandbox();
+        }
+        return null;
     }
 
     private TranscriptStore transcriptStoreForMirror(AbstractFilesystem mirrorFs) {

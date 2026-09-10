@@ -21,6 +21,7 @@ import io.agentscope.harness.agent.sandbox.Sandbox;
 import io.agentscope.harness.agent.sandbox.SandboxAcquireResult;
 import io.agentscope.harness.agent.sandbox.SandboxContext;
 import io.agentscope.harness.agent.sandbox.SandboxManager;
+import io.agentscope.harness.agent.sandbox.SandboxMirrorReleaseCoordinator;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,10 +40,12 @@ import org.slf4j.LoggerFactory;
  *
  * <h2>doFinally</h2>
  * <ol>
+ *   <li>Clear this call's session binding from the {@link RuntimeContext} (and the filesystem
+ *       proxy fallback) so concurrent calls cannot observe a stale binding</li>
  *   <li>Persist sandbox session state via {@link SandboxManager} and
  *       {@link io.agentscope.harness.agent.sandbox.SessionSandboxStateStore}</li>
- *   <li>Release the session via {@link SandboxManager} (stop + optional shutdown)</li>
- *   <li>Clear this call's session binding from the {@link RuntimeContext}</li>
+ *   <li>Request release via {@link SandboxMirrorReleaseCoordinator} (defers stop/shutdown while
+ *       session mirrors still need the connection; otherwise releases immediately)</li>
  * </ol>
  *
  * <p>Post-call failures (persist, release) are logged but do not propagate — this ensures
@@ -126,14 +129,14 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
                 ctx.put(SandboxAcquireResult.class, null);
                 filesystemProxy.clearSandboxIfCurrent(sandbox);
                 try {
-                    sandboxManager.release(result);
+                    // No mirrors can be pending before start succeeds; release immediately.
+                    SandboxMirrorReleaseCoordinator.requestRelease(sandboxManager, result);
                 } catch (Exception releaseErr) {
                     log.warn(
                             "[sandbox-mw] Failed to release session after pre-call failure: {}",
                             releaseErr.getMessage(),
                             releaseErr);
                 }
-                result.getLease().close();
                 throw e;
             }
         } catch (Exception e) {
@@ -169,10 +172,11 @@ public class SandboxLifecycleMiddleware implements HarnessRuntimeMiddleware {
             log.warn("[sandbox-mw] Failed to persist sandbox state: {}", e.getMessage(), e);
         }
         try {
-            sandboxManager.release(result);
+            // Hand destructive stop/shutdown (and lease close) to outstanding session mirrors
+            // when present; otherwise release immediately. Call binding is already cleared above.
+            SandboxMirrorReleaseCoordinator.requestRelease(sandboxManager, result);
         } catch (Exception e) {
             log.warn("[sandbox-mw] Failed to release sandbox session: {}", e.getMessage(), e);
         }
-        result.getLease().close();
     }
 }
